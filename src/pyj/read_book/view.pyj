@@ -433,7 +433,7 @@ class View:
         elif data.name is 'toggle_highlights':
             ui_operations.toggle_highlights()
         elif data.name is 'create_annotation':
-            self.iframe_wrapper.send_message('create_annotation')
+            self.initiate_create_annotation()
         elif data.name is 'new_bookmark':
             ui_operations.new_bookmark()
         elif data.name is 'toggle_inspector':
@@ -774,14 +774,21 @@ class View:
             self.loaded_resources = {}
             self.content_popup_overlay.loaded_resources = {}
             self.timers.start_book(book)
+        unkey = username_key(get_interface_data().username)
         self.book = current_book.book = book
-        self.annotations_manager.set_highlights(book.highlights or v'[]')
+        hl = None
+        if runtime.is_standalone_viewer:
+            hl = book.highlights
+            v'delete book.highlights'
+        else:
+            if unkey and book.annotations_map[unkey]:
+                hl = book.annotations_map[unkey].highlight
+        self.annotations_manager.set_highlights(hl or v'[]')
         if runtime.is_standalone_viewer:
             add_book_to_recently_viewed(book)
         if ui_operations.update_last_read_time:
             ui_operations.update_last_read_time(book)
         pos = {'replace_history':True}
-        unkey = username_key(get_interface_data().username)
         name = book.manifest.spine[0]
         cfi = None
         if initial_position and initial_position.type is 'cfi' and initial_position.data.startswith('epubcfi(/'):
@@ -980,6 +987,21 @@ class View:
         if toc:
             process_node(toc)
         return found
+
+    def sync_data_received(self, reading_pos_cfi, annotations_map):
+        if annotations_map:
+            ui_operations.annotations_synced(annotations_map)
+            if annotations_map.highlight:
+                if self.annotations_manager.merge_highlights(annotations_map.highlight):
+                    hl = self.annotations_manager.highlights_for_currently_showing()
+                    self.iframe_wrapper.send_message('replace_highlights', highlights=hl)
+        if reading_pos_cfi:
+            self.goto_cfi(reading_pos_cfi)
+
+    def set_notes_for_highlight(self, uuid, notes):
+        if self.annotations_manager.set_notes_for_highlight(uuid, notes):
+            if self.view_annotation.is_visible and self.view_annotation.showing_uuid is uuid:
+                self.view_annotation.show(uuid)
 
     def on_next_spine_item(self, data):
         spine = self.book.manifest.spine
@@ -1191,6 +1213,9 @@ class View:
             self.iframe_wrapper.send_message('show_search_result', search_result=sr)
         else:
             self.show_name(sr.file_name, initial_position={'type':'search_result', 'search_result':sr, 'replace_history':True})
+
+    def initiate_create_annotation(self):
+        self.iframe_wrapper.send_message('create_annotation')
 
     def highlight_action(self, uuid, which):
         if self.create_annotation.is_visible:

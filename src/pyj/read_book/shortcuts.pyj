@@ -3,7 +3,6 @@
 from __python__ import bound_methods, hash_literals
 
 from gettext import gettext as _
-
 from read_book.globals import runtime
 
 
@@ -337,7 +336,6 @@ def shortcuts_definition():
             'ui',
             _('Create a highlight'),
         )
-
     return ans
 
 

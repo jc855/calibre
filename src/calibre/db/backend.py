@@ -42,14 +42,15 @@ from calibre.db.tables import (OneToOneTable, ManyToOneTable, ManyToManyTable,
         CompositeTable, UUIDTable, RatingTable)
 # }}}
 
-'''
-Differences in semantics from pysqlite:
 
-    1. execute/executemany operate in autocommit mode
-    2. There is no fetchone() method on cursor objects, instead use next(cursor)
-    3. There is no executescript
+class FTSQueryError(ValueError):
 
-'''
+    def __init__(self, query, sql_statement, apsw_error):
+        ValueError.__init__(self, 'Failed to parse search query: {} with error: {}'.format(query, apsw_error))
+        self.query = query
+        self.sql_statement = sql_statement
+
+
 CUSTOM_DATA_TYPES = frozenset(('rating', 'text', 'comments', 'datetime',
     'int', 'float', 'bool', 'series', 'composite', 'enumeration'))
 WINDOWS_RESERVED_NAMES = frozenset('CON PRN AUX NUL COM1 COM2 COM3 COM4 COM5 COM6 COM7 COM8 COM9 LPT1 LPT2 LPT3 LPT4 LPT5 LPT6 LPT7 LPT8 LPT9'.split())
@@ -280,6 +281,42 @@ def AumSortedConcatenate():
 
     return ({}, step, finalize)
 
+# }}}
+
+
+# Annotations {{{
+def annotations_for_book(cursor, book_id, fmt, user_type='local', user='viewer'):
+    for (data,) in cursor.execute(
+        'SELECT annot_data FROM annotations WHERE book=? AND format=? AND user_type=? AND user=?',
+        (book_id, fmt.upper(), user_type, user)
+    ):
+        try:
+            yield json.loads(data)
+        except Exception:
+            pass
+
+
+def save_annotations_for_book(cursor, book_id, fmt, annots_list, user_type='local', user='viewer'):
+    data = []
+    fmt = fmt.upper()
+    for annot, timestamp_in_secs in annots_list:
+        atype = annot['type'].lower()
+        if atype == 'bookmark':
+            aid = text = annot['title']
+        elif atype == 'highlight':
+            aid = annot['uuid']
+            text = annot.get('highlighted_text') or ''
+            notes = annot.get('notes') or ''
+            if notes:
+                text += '\n\x1f\n' + notes
+        else:
+            continue
+        data.append((book_id, fmt, user_type, user, timestamp_in_secs, aid, atype, json.dumps(annot), text))
+    cursor.execute('INSERT OR IGNORE INTO annotations_dirtied (book) VALUES (?)', (book_id,))
+    cursor.execute('DELETE FROM annotations WHERE book=? AND format=? AND user_type=? AND user=?', (book_id, fmt, user_type, user))
+    cursor.executemany(
+        'INSERT OR REPLACE INTO annotations (book, format, user_type, user, timestamp, annot_id, annot_type, annot_data, searchable_text)'
+        ' VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', data)
 # }}}
 
 
@@ -1721,8 +1758,147 @@ class DB(object):
         else:
             self.execute('DELETE FROM books_plugin_data WHERE name=?', (name,))
 
+    def dirtied_books(self):
+        for (book_id,) in self.execute('SELECT book FROM metadata_dirtied'):
+            yield book_id
+
+    def dirty_books(self, book_ids):
+        self.executemany('INSERT OR IGNORE INTO metadata_dirtied (book) VALUES (?)', ((x,) for x in book_ids))
+
+    def mark_book_as_clean(self, book_id):
+        self.execute('DELETE FROM metadata_dirtied WHERE book=?', (book_id,))
+
     def get_ids_for_custom_book_data(self, name):
         return frozenset(r[0] for r in self.execute('SELECT book FROM books_plugin_data WHERE name=?', (name,)))
+
+    def annotations_for_book(self, book_id, fmt, user_type, user):
+        for x in annotations_for_book(self.conn, book_id, fmt, user_type, user):
+            yield x
+
+    def search_annotations(self,
+        fts_engine_query, use_stemming, highlight_start, highlight_end, snippet_size, annotation_type,
+        restrict_to_book_ids, restrict_to_user, ignore_removed=False
+    ):
+        fts_table = 'annotations_fts_stemmed' if use_stemming else 'annotations_fts'
+        text = 'annotations.searchable_text'
+        if highlight_start is not None and highlight_end is not None:
+            if snippet_size is not None:
+                text = 'snippet({fts_table}, 0, "{highlight_start}", "{highlight_end}", "…", {snippet_size})'.format(
+                        fts_table=fts_table, highlight_start=highlight_start, highlight_end=highlight_end,
+                        snippet_size=max(1, min(snippet_size, 64)))
+            else:
+                text = 'highlight({}, 0, "{}", "{}")'.format(fts_table, highlight_start, highlight_end)
+        query = 'SELECT {0}.id, {0}.book, {0}.format, {0}.user_type, {0}.user, {0}.annot_data, {1} FROM {0} '
+        query = query.format('annotations', text)
+        query += ' JOIN {fts_table} ON annotations.id = {fts_table}.rowid'.format(fts_table=fts_table)
+        query += ' WHERE {fts_table} MATCH ?'.format(fts_table=fts_table)
+        data = [fts_engine_query]
+        if restrict_to_user:
+            query += ' AND annotations.user_type = ? AND annotations.user = ?'
+            data += list(*restrict_to_user)
+        if annotation_type:
+            query += ' AND annotations.annot_type = ? '
+            data.append(annotation_type)
+        query += ' ORDER BY {}.rank '.format(fts_table)
+        ls = json.loads
+        try:
+            for (rowid, book_id, fmt, user_type, user, annot_data, text) in self.execute(query, tuple(data)):
+                try:
+                    parsed_annot = ls(annot_data)
+                except Exception:
+                    continue
+                if ignore_removed and parsed_annot.get('removed'):
+                    continue
+                yield {
+                    'id': rowid,
+                    'book_id': book_id,
+                    'format': fmt,
+                    'user_type': user_type,
+                    'user': user,
+                    'text': text,
+                    'annotation': parsed_annot,
+                }
+        except apsw.SQLError as e:
+            raise FTSQueryError(fts_engine_query, query, e)
+
+    def all_annotations_for_book(self, book_id, ignore_removed=False):
+        for (fmt, user_type, user, data) in self.execute(
+            'SELECT id, book, format, user_type, user, annot_data FROM annotations WHERE book=?', (book_id,)
+        ):
+            try:
+                annot = json.loads(data)
+            except Exception:
+                pass
+            if not ignore_removed or not annot.get('removed'):
+                yield {'format': fmt, 'user_type': user_type, 'user': user, 'annotation': annot}
+
+    def all_annotations(self, restrict_to_user=None, limit=None, annotation_type=None, ignore_removed=False):
+        ls = json.loads
+        q = 'SELECT id, book, format, user_type, user, annot_data FROM annotations'
+        data = []
+        if restrict_to_user or annotation_type:
+            q += ' WHERE '
+        if restrict_to_user is not None:
+            data.extend(restrict_to_user)
+            q += ' user_type = ? AND user = ?'
+        if annotation_type:
+            data.append(annotation_type)
+            q += ' annot_type = ? '
+        q += ' ORDER BY timestamp'
+        count = 0
+        for (rowid, book_id, fmt, user_type, user, annot_data) in self.execute(q, tuple(data)):
+            try:
+                annot = ls(annot_data)
+                atype = annot['type']
+            except Exception:
+                continue
+            if ignore_removed and annot.get('removed'):
+                continue
+            text = ''
+            if atype == 'bookmark':
+                text = annot['title']
+            elif atype == 'highlight':
+                text = annot.get('highlighted_text') or ''
+            yield {
+                'id': rowid,
+                'book_id': book_id,
+                'format': fmt,
+                'user_type': user_type,
+                'user': user,
+                'text': text,
+                'annotation': annot,
+            }
+            count += 1
+            if limit is not None and count >= limit:
+                break
+
+    def all_annotation_users(self):
+        return self.execute('SELECT DISTINCT user_type, user FROM annotations')
+
+    def all_annotation_types(self):
+        for x in self.execute('SELECT DISTINCT annot_type FROM annotations'):
+            yield x[0]
+
+    def set_annotations_for_book(self, book_id, fmt, annots_list, user_type='local', user='viewer'):
+        try:
+            with self.conn:  # Disable autocommit mode, for performance
+                save_annotations_for_book(self.conn.cursor(), book_id, fmt, annots_list, user_type, user)
+        except apsw.IOError:
+            # This can happen if the computer was suspended see for example:
+            # https://bugs.launchpad.net/bugs/1286522. Try to reopen the db
+            if not self.conn.getautocommit():
+                raise  # We are in a transaction, re-opening the db will fail anyway
+            self.reopen(force=True)
+            with self.conn:  # Disable autocommit mode, for performance
+                save_annotations_for_book(self.conn.cursor(), book_id, fmt, annots_list, user_type, user)
+
+    def dirty_books_with_dirtied_annotations(self):
+        with self.conn:
+            self.execute('INSERT or IGNORE INTO metadata_dirtied(book) SELECT book FROM annotations_dirtied;')
+            changed = self.conn.changes() > 0
+            if changed:
+                self.execute('DELETE FROM annotations_dirtied')
+        return changed
 
     def conversion_options(self, book_id, fmt):
         for (data,) in self.conn.get('SELECT data FROM conversion_options WHERE book=? AND format=?', (book_id, fmt.upper())):

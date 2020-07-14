@@ -8,7 +8,7 @@ import os, glob, re
 from calibre import guess_type
 from calibre.customize import (FileTypePlugin, MetadataReaderPlugin,
     MetadataWriterPlugin, PreferencesPlugin, InterfaceActionBase, StoreBase)
-from calibre.constants import numeric_version
+from calibre.constants import numeric_version, in_develop_mode
 from calibre.ebooks.metadata.archive import ArchiveExtract, KPFExtract, get_comic_metadata
 from calibre.ebooks.html.to_zip import HTML2ZIP
 
@@ -871,6 +871,12 @@ class ActionPolish(InterfaceActionBase):
     description = _('Fine tune your e-books')
 
 
+class ActionBrowseAnnotations(InterfaceActionBase):
+    name = 'Browse Annotations'
+    actual_plugin = 'calibre.gui2.actions.browse_annots:BrowseAnnotationsAction'
+    description = _('Browse highlights and bookmarks from all books in the library')
+
+
 class ActionEditToC(InterfaceActionBase):
     name = 'Edit ToC'
     actual_plugin = 'calibre.gui2.actions.toc_edit:ToCEditAction'
@@ -1096,6 +1102,8 @@ plugins += [ActionAdd, ActionFetchAnnotations, ActionGenerateCatalog,
         ActionPluginUpdater, ActionPickRandom, ActionEditToC, ActionSortBy,
         ActionMarkBooks, ActionEmbed, ActionTemplateTester, ActionTagMapper, ActionAuthorMapper,
         ActionVirtualLibrary]
+if in_develop_mode:
+    plugins.append(ActionBrowseAnnotations)
 
 # }}}
 

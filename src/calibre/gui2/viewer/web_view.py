@@ -19,21 +19,21 @@ from PyQt5.QtWebEngineWidgets import (
 
 from calibre import as_unicode, prints
 from calibre.constants import (
-    FAKE_HOST, FAKE_PROTOCOL, __version__, config_dir, is_running_from_develop,
+    FAKE_HOST, FAKE_PROTOCOL, __version__, in_develop_mode, is_running_from_develop,
     isosx, iswindows
 )
 from calibre.ebooks.metadata.book.base import field_metadata
 from calibre.ebooks.oeb.polish.utils import guess_type
 from calibre.gui2 import choose_images, error_dialog, safe_open_url
+from calibre.gui2.viewer.config import viewer_config_dir, vprefs
 from calibre.gui2.webengine import (
     Bridge, RestartingWebEngineView, create_script, from_js, insert_scripts,
     secure_webengine, to_js
 )
 from calibre.srv.code import get_translations_data
-from calibre.utils.config import JSONConfig
 from calibre.utils.serialize import json_loads
 from calibre.utils.shared_file import share_open
-from polyglot.builtins import as_bytes, hasenv, iteritems, unicode_type
+from polyglot.builtins import as_bytes, iteritems, unicode_type
 from polyglot.functools import lru_cache
 
 try:
@@ -42,16 +42,9 @@ except ImportError:
     import sip
 
 SANDBOX_HOST = FAKE_HOST.rpartition('.')[0] + '.sandbox'
-vprefs = JSONConfig('viewer-webengine')
-viewer_config_dir = os.path.join(config_dir, 'viewer')
-vprefs.defaults['session_data'] = {}
-vprefs.defaults['local_storage'] = {}
-vprefs.defaults['main_window_state'] = None
-vprefs.defaults['main_window_geometry'] = None
-vprefs.defaults['old_prefs_migrated'] = False
-
 
 # Override network access to load data from the book {{{
+
 
 def set_book_path(path, pathtoebook):
     set_book_path.pathtoebook = pathtoebook
@@ -207,12 +200,6 @@ class UrlSchemeHandler(QWebEngineUrlSchemeHandler):
 # }}}
 
 
-def get_session_pref(name, default=None, group='standalone_misc_settings'):
-    sd = vprefs['session_data']
-    g = sd.get(group, {}) if group else sd
-    return g.get(name, default)
-
-
 def create_profile():
     ans = getattr(create_profile, 'ans', None)
     if ans is None:
@@ -229,8 +216,8 @@ def create_profile():
         js = P('viewer.js', data=True, allow_user_override=False)
         translations_json = get_translations_data() or b'null'
         js = js.replace(b'__TRANSLATIONS_DATA__', translations_json, 1)
-        if hasenv('CALIBRE_ENABLE_DEVELOP_MODE'):
-            js = js.replace(b'__IN_DEVELOP_MODE__', os.environ['CALIBRE_ENABLE_DEVELOP_MODE'].encode('ascii'))
+        if in_develop_mode:
+            js = js.replace(b'__IN_DEVELOP_MODE__', b'1')
         insert_scripts(ans, create_script('viewer.js', js))
         url_handler = UrlSchemeHandler(ans)
         ans.installUrlSchemeHandler(QByteArray(FAKE_PROTOCOL.encode('ascii')), url_handler)
@@ -294,6 +281,7 @@ class ViewerBridge(Bridge):
     trigger_shortcut = to_js()
     set_system_palette = to_js()
     highlight_action = to_js()
+    generic_action = to_js()
     show_search_result = to_js()
     prepare_for_close = to_js()
     viewer_font_size_changed = to_js()
@@ -699,6 +687,10 @@ class WebView(RestartingWebEngineView):
 
     def highlight_action(self, uuid, which):
         self.execute_when_ready('highlight_action', uuid, which)
+        self.setFocus(Qt.OtherFocusReason)
+
+    def generic_action(self, which, data):
+        self.execute_when_ready('generic_action', which, data)
 
     def contextMenuEvent(self, ev):
         ev.accept()
